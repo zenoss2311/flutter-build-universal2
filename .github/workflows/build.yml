@@ -1,0 +1,187 @@
+name: Build Flutter APK (Universal)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_url:
+        description: 'URL halaman release GitHub yang berisi ZIP project'
+        required: true
+      tag:
+        description: 'Tag release'
+        required: true
+      build_type:
+        description: 'debug atau release'
+        required: true
+        default: 'release'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download & extract project ZIP
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          REPO="${{ github.repository }}"
+          TAG="${{ inputs.tag }}"
+          ASSET_URL=$(curl -sL -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$REPO/releases/tags/$TAG" | \
+            python3 -c "import sys,json; d=json.load(sys.stdin); print(d['assets'][0]['url'])")
+          curl -sL -H "Authorization: token $GH_TOKEN" -H "Accept: application/octet-stream" \
+            "$ASSET_URL" -o project.zip
+          mkdir -p project_raw
+          unzip -q project.zip -d project_raw
+
+      - name: Cari pubspec.yaml
+        id: findroot
+        run: |
+          PUBSPEC=$(find project_raw -maxdepth 6 -name "pubspec.yaml" | head -n1)
+          if [ -z "$PUBSPEC" ]; then
+            echo "❌ pubspec.yaml tidak ditemukan!"
+            exit 1
+          fi
+          ROOT=$(dirname "$PUBSPEC")
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+          echo "📁 Root project: $ROOT"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: 🔧 AUTO-FIX SEMUA MASALAH (Termasuk V1 Embedding)
+        working-directory: ${{ steps.findroot.outputs.root }}
+        run: |
+          echo "🔧 Memeriksa dan memperbaiki kompatibilitas..."
+          
+          # ─── 1. FIX Android V1 Embedding ───
+          echo "🔧 Memeriksa Android V1 Embedding..."
+          
+          # Fix AndroidManifest.xml
+          if [ -f "android/app/src/main/AndroidManifest.xml" ]; then
+            if grep -q "io.flutter.app.FlutterApplication" android/app/src/main/AndroidManifest.xml; then
+              echo "⚠️ Detected V1 Embedding! Auto-migrating..."
+              sed -i 's/io.flutter.app.FlutterApplication/android.app.Application/g' android/app/src/main/AndroidManifest.xml
+            fi
+            if grep -q "io.flutter.app.FlutterActivity" android/app/src/main/AndroidManifest.xml; then
+              sed -i 's/io.flutter.app.FlutterActivity/io.flutter.embedding.android.FlutterActivity/g' android/app/src/main/AndroidManifest.xml
+            fi
+            # Tambahkan flutterEmbedding jika belum ada
+            if ! grep -q "flutterEmbedding" android/app/src/main/AndroidManifest.xml; then
+              sed -i '/</application>/i         <meta-data android:name="flutterEmbedding" android:value="2" />' android/app/src/main/AndroidManifest.xml
+            fi
+          fi
+
+          # Fix MainActivity.java
+          if [ -f "android/app/src/main/java/io/flutter/app/MainActivity.java" ]; then
+            echo "🔧 Memperbaiki MainActivity.java..."
+            sed -i 's/extends FlutterActivity/extends io.flutter.embedding.android.FlutterActivity/g' android/app/src/main/java/io/flutter/app/MainActivity.java
+          fi
+          if [ -f "android/app/src/main/java/io/flutter/app/MainActivity.kt" ]; then
+            echo "🔧 Memperbaiki MainActivity.kt..."
+            sed -i 's/FlutterActivity()/io.flutter.embedding.android.FlutterActivity()/g' android/app/src/main/java/io/flutter/app/MainActivity.kt
+          fi
+
+          # ─── 2. FIX font_awesome_flutter ───
+          if grep -q "font_awesome_flutter:" pubspec.yaml; then
+            echo "📦 Detected font_awesome_flutter"
+            VERSION=$(grep "font_awesome_flutter:" pubspec.yaml | sed 's/.*: //' | tr -d '"' | sed 's/^//g')
+            MAJOR=$(echo $VERSION | cut -d. -f1)
+            MINOR=$(echo $VERSION | cut -d. -f2)
+            
+            if [ "$MAJOR" -ge 10 ] && [ "$MINOR" -ge 9 ]; then
+              echo "⚠️ font_awesome_flutter $VERSION tidak kompatibel, downgrade ke 10.8.0"
+              sed -i 's/font_awesome_flutter:.*/font_awesome_flutter: 10.8.0/' pubspec.yaml
+            fi
+          fi
+
+          # ─── 3. FIX Kotlin ───
+          if [ -f "android/build.gradle" ]; then
+            echo "🔧 Memeriksa Kotlin version..."
+            if grep -q "ext.kotlin_version" android/build.gradle; then
+              sed -i 's/ext.kotlin_version = .*/ext.kotlin_version = "2.0.0"/' android/build.gradle
+            fi
+          fi
+
+          # ─── 4. FIX Gradle ───
+          if [ -f "android/gradle/wrapper/gradle-wrapper.properties" ]; then
+            echo "🔧 Memeriksa Gradle version..."
+            sed -i 's/gradle-[0-9.]*-all.zip/gradle-8.14-all.zip/g' android/gradle/wrapper/gradle-wrapper.properties
+          fi
+
+          # ─── 5. FIX AGP ───
+          if [ -f "android/build.gradle" ]; then
+            echo "🔧 Memeriksa AGP version..."
+            sed -i 's/com.android.tools.build:gradle:[0-9.]*/com.android.tools.build:gradle:8.11.1/g' android/build.gradle
+          fi
+
+          # ─── 6. FIX minSdkVersion ───
+          if [ -f "android/app/build.gradle" ]; then
+            echo "🔧 Memeriksa minSdkVersion..."
+            if ! grep -q "minSdkVersion" android/app/build.gradle; then
+              sed -i '/defaultConfig {/a         minSdkVersion 21' android/app/build.gradle
+            fi
+          fi
+
+          echo "✅ Auto-fix selesai!"
+
+      - name: Flutter pub get
+        working-directory: ${{ steps.findroot.outputs.root }}
+        run: |
+          flutter pub get || {
+            echo "⚠️ Pub get gagal, mencoba force..."
+            rm -rf .dart_tool
+            flutter pub get
+          }
+
+      - name: Build APK dengan fallback
+        working-directory: ${{ steps.findroot.outputs.root }}
+        run: |
+          echo "🚀 Memulai build..."
+          
+          if [ "${{ inputs.build_type }}" == "debug" ]; then
+            flutter build apk --debug || {
+              echo "⚠️ Build gagal, mencoba --no-sound-null-safety..."
+              flutter build apk --debug --no-sound-null-safety || {
+                echo "⚠️ Build gagal, mencoba --split-debug-info..."
+                flutter build apk --debug --split-debug-info=./debug-info || {
+                  exit 1
+                }
+              }
+            }
+          else
+            flutter build apk --release || {
+              echo "⚠️ Build gagal, mencoba --no-sound-null-safety..."
+              flutter build apk --release --no-sound-null-safety || {
+                echo "⚠️ Build gagal, mencoba --split-debug-info..."
+                flutter build apk --release --split-debug-info=./debug-info || {
+                  exit 1
+                }
+              }
+            }
+          fi
+
+      - name: Cari APK hasil build
+        id: findapk
+        run: |
+          APK_PATH=$(find ${{ steps.findroot.outputs.root }}/build -name "*.apk" | head -n1)
+          if [ -z "$APK_PATH" ]; then
+            echo "❌ APK tidak ditemukan!"
+            exit 1
+          fi
+          echo "apk_path=$APK_PATH" >> "$GITHUB_OUTPUT"
+          echo "📱 APK ditemukan: $APK_PATH"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-build
+          path: ${{ steps.findapk.outputs.apk_path }}
+          retention-days: 1
